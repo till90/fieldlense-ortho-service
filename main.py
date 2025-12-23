@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 import json
-import math
 import os
 import time
 import uuid
@@ -12,23 +11,18 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import requests
-from flask import (
-    Flask,
-    Response,
-    jsonify,
-    render_template_string,
-    request,
-    send_file,
-)
+from flask import Flask, Response, jsonify, render_template_string, request, send_file
 from PIL import Image
 from pyproj import Transformer
 from shapely.geometry import shape, mapping
 from shapely.ops import transform as shp_transform
 
-# Raster stack
 import rasterio
 from rasterio.io import MemoryFile
 from rasterio.mask import mask as rio_mask
+
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # -------------------------------
 # Config (Cloud Run friendly)
@@ -36,7 +30,6 @@ from rasterio.mask import mask as rio_mask
 
 APP_TITLE = os.getenv("APP_TITLE", "Hessen DOP20 – AOI Snapshot (WCS)")
 
-# Try multiple endpoints (because some environments resolve one but not the other)
 WCS_URLS = [
     u.strip()
     for u in os.getenv(
@@ -47,28 +40,27 @@ WCS_URLS = [
 ]
 
 WCS_VERSION = os.getenv("WCS_VERSION", "2.0.1")
-
-# CoverageId: best guess; code also tries to auto-detect from capabilities at runtime
 WCS_COVERAGE_ID = os.getenv("WCS_COVERAGE_ID", "he_dop20")
 
-# CRS used for subsetting/buffering (metric). HVBG lists EPSG:25832 for the service scope.
+# CRS used for subsetting/masking (metric).
 WCS_EPSG = int(os.getenv("WCS_EPSG", "25832"))
 WCS_SUBSET_AXES = os.getenv("WCS_SUBSET_AXES", "e,n")  # default per HVBG examples
 
-# Buffer around AOI (meters). Buffer is used as overall raster extent; DOP pixels outside AOI become transparent/nodata.
-DEFAULT_BUFFER_M = float(os.getenv("DEFAULT_BUFFER_M", "200"))
-
-# Safety limits (important, DOP20 at 20 cm can explode quickly)
-MAX_AOI_AREA_KM2 = float(os.getenv("MAX_AOI_AREA_KM2", "1.0"))  # AOI polygon area limit
-MAX_RASTER_DIM_PX = int(os.getenv("MAX_RASTER_DIM_PX", "2048"))  # target max width/height requested via scaling
+# Safety limits
+MAX_AOI_AREA_KM2 = float(os.getenv("MAX_AOI_AREA_KM2", "1.0"))   # AOI polygon area limit
+MAX_RASTER_DIM_PX = int(os.getenv("MAX_RASTER_DIM_PX", "2048"))  # requested max width/height (when scaling works)
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "60"))
 
-# Temp cache in Cloud Run (ephemeral)
+# DOP20 nominal resolution (used only to guard the "no scaling" fallback)
+NATIVE_RES_M = float(os.getenv("NATIVE_RES_M", "0.2"))
+MAX_NATIVE_DIM_PX = int(os.getenv("MAX_NATIVE_DIM_PX", "6000"))  # guard for unscaled fallback
+
+# Temp cache in Cloud Run (ephemeral) – keep small, Cloud Run counts FS into memory usage. :contentReference[oaicite:4]{index=4}
 TMP_DIR = Path(os.getenv("TMP_DIR", "/tmp")) / "aoi_cache"
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "3600"))
-MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "40"))
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))   # 15 min default
+MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "10"))        # keep small by default
 
 # -------------------------------
 # Flask
@@ -76,6 +68,27 @@ MAX_CACHE_ITEMS = int(os.getenv("MAX_CACHE_ITEMS", "40"))
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
+
+# -------------------------------
+# HTTP session with retries (WCS)
+# -------------------------------
+
+def _make_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.6,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    s.headers.update({"User-Agent": "data-tales-aoi-snapshot/1.0"})
+    return s
+
+HTTP = _make_session()
 
 # -------------------------------
 # Helpers
@@ -86,9 +99,30 @@ class RenderResult:
     job_id: str
     bounds_wgs84: Tuple[Tuple[float, float], Tuple[float, float]]  # ((south, west), (north, east))
     aoi_area_km2: float
-    buffer_m: float
     png_path: Path
     tif_path: Path
+    wcs_request_url: str
+    wcs_base_url: str
+    coverage_id: str
+    used_scaling: bool
+    out_size: Optional[Tuple[int, int]]  # (w,h) when scaling used
+
+
+class WCSRequestError(Exception):
+    def __init__(
+        self,
+        message: str,
+        *,
+        request_url: Optional[str] = None,
+        status_code: Optional[int] = None,
+        content_type: Optional[str] = None,
+        body_excerpt: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_url = request_url
+        self.status_code = status_code
+        self.content_type = content_type
+        self.body_excerpt = body_excerpt
 
 
 def _cleanup_cache() -> None:
@@ -100,8 +134,8 @@ def _cleanup_cache() -> None:
                 items.append((p.stat().st_mtime, p))
         items.sort(reverse=True)  # newest first
 
-        # TTL cleanup
         now = time.time()
+        # TTL cleanup
         for mtime, p in items:
             if now - mtime > CACHE_TTL_SECONDS:
                 try:
@@ -109,7 +143,7 @@ def _cleanup_cache() -> None:
                 except Exception:
                     pass
 
-        # size cap cleanup
+        # size cap by count
         items = []
         for p in TMP_DIR.glob("*"):
             if p.is_file():
@@ -122,7 +156,6 @@ def _cleanup_cache() -> None:
                 except Exception:
                     pass
     except Exception:
-        # never fail request due to cleanup
         pass
 
 
@@ -169,18 +202,18 @@ def _geom_to_epsg(geom, src_epsg: int, dst_epsg: int):
     return shp_transform(lambda x, y: tr.transform(x, y), geom)
 
 
-def _bounds_epsg_to_wgs84(minx: float, miny: float, maxx: float, maxy: float, src_epsg: int) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+def _bounds_epsg_to_wgs84(
+    minx: float, miny: float, maxx: float, maxy: float, src_epsg: int
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
     tr = _transformer(src_epsg, 4326)
     west, south = tr.transform(minx, miny)
     east, north = tr.transform(maxx, maxy)
-    # Leaflet bounds: [[south, west], [north, east]]
     return (south, west), (north, east)
 
 
 def _compute_scaled_dims(width_m: float, height_m: float, max_dim_px: int) -> Tuple[int, int]:
     if width_m <= 0 or height_m <= 0:
         raise ValueError("Ungültige Ausdehnung (Breite/Höhe <= 0).")
-    # Keep aspect ratio, cap by max_dim_px
     if width_m >= height_m:
         w = max_dim_px
         h = max(1, int(round(max_dim_px * (height_m / width_m))))
@@ -190,16 +223,10 @@ def _compute_scaled_dims(width_m: float, height_m: float, max_dim_px: int) -> Tu
     return w, h
 
 
-def _pick_working_base_url() -> str:
-    # Prefer first; if request fails, try next per-call.
-    return WCS_URLS[0]
-
-
 def _try_get_capabilities(base_url: str) -> Optional[str]:
-    # Some servers insist on VERSION; others accept without.
     params = {"SERVICE": "WCS", "REQUEST": "GetCapabilities", "VERSION": WCS_VERSION}
     try:
-        r = requests.get(base_url, params=params, timeout=HTTP_TIMEOUT)
+        r = HTTP.get(base_url, params=params, timeout=HTTP_TIMEOUT)
         if r.ok and ("Coverage" in r.text or "Capabilities" in r.text):
             return r.text
     except Exception:
@@ -208,13 +235,10 @@ def _try_get_capabilities(base_url: str) -> Optional[str]:
 
 
 def _detect_coverage_id_from_caps(xml_text: str) -> Optional[str]:
-    # Minimal, robust string-based fallback (no heavy XML libs)
-    # Strategy: find tokens that look like coverage ids and contain "dop20"
     low = xml_text.lower()
     if "dop20" not in low:
         return None
 
-    # Naive scan for common tags (<wcs:CoverageId>, <CoverageId>, <gml:identifier>, etc.)
     candidates = []
     for tag in ["coverageid", "wcs:coverageid", "gml:identifier", "identifier"]:
         start = 0
@@ -230,11 +254,9 @@ def _detect_coverage_id_from_caps(xml_text: str) -> Optional[str]:
                     candidates.append(val)
             start = k + 1 if k != -1 else j + 1
 
-    # Prefer shortest (often the actual id)
     if candidates:
         candidates.sort(key=lambda s: (len(s), s))
         return candidates[0]
-
     return None
 
 
@@ -244,37 +266,31 @@ def _build_getcoverage_params(
     subset_axes: Tuple[str, str],
     out_w: Optional[int] = None,
     out_h: Optional[int] = None,
-) -> Dict[str, str]:
+) -> Dict[str, Any]:
     minx, miny, maxx, maxy = bbox
     ax_x, ax_y = subset_axes
 
-    params: Dict[str, str] = {
+    params: Dict[str, Any] = {
         "SERVICE": "WCS",
         "REQUEST": "GetCoverage",
         "VERSION": WCS_VERSION,
         "COVERAGEID": coverage_id,
-        # HVBG examples use FORMAT=GTIFF
         "FORMAT": "GTIFF",
-        # CRS URN form used by many INSPIRE services:
         "SUBSETTINGCRS": f"http://www.opengis.net/def/crs/EPSG/0/{WCS_EPSG}",
         "OUTPUTCRS": f"http://www.opengis.net/def/crs/EPSG/0/{WCS_EPSG}",
-        # Axis subsetting (e/n per HVBG sample)
         "SUBSET": [
             f"{ax_x}({minx},{maxx})",
             f"{ax_y}({miny},{maxy})",
         ],
     }
 
-    # Scaling extension (best effort). If server rejects, we retry without.
     if out_w and out_h:
         params["SCALESIZE"] = f"i({out_w}),j({out_h})"
 
     return params
 
 
-def _request_wcs_geotiff(base_url: str, params: Dict[str, Any]) -> bytes:
-    # requests cannot send list values via params dict cleanly unless we pass list-of-tuples
-    # Convert params to list-of-tuples, preserving multiple SUBSET keys.
+def _params_to_tuples(params: Dict[str, Any]):
     q = []
     for k, v in params.items():
         if isinstance(v, list):
@@ -282,25 +298,45 @@ def _request_wcs_geotiff(base_url: str, params: Dict[str, Any]) -> bytes:
                 q.append((k, item))
         else:
             q.append((k, v))
+    return q
 
-    r = requests.get(base_url, params=q, timeout=HTTP_TIMEOUT)
+
+def _build_full_url(base_url: str, q_tuples) -> str:
+    req = requests.Request("GET", base_url, params=q_tuples).prepare()
+    return req.url
+
+
+def _request_wcs_geotiff(base_url: str, params: Dict[str, Any]) -> Tuple[bytes, str]:
+    q = _params_to_tuples(params)
+    full_url = _build_full_url(base_url, q)
+
+    r = HTTP.get(base_url, params=q, timeout=HTTP_TIMEOUT)
     ct = (r.headers.get("Content-Type") or "").lower()
 
     if not r.ok:
-        # Try to parse meaningful message
-        msg = r.text[:1200] if r.text else f"HTTP {r.status_code}"
-        raise ValueError(f"WCS-Request fehlgeschlagen ({r.status_code}). Antwort: {msg}")
+        msg = (r.text or "")[:1200]
+        raise WCSRequestError(
+            f"WCS-Request fehlgeschlagen ({r.status_code}).",
+            request_url=full_url,
+            status_code=r.status_code,
+            content_type=ct,
+            body_excerpt=msg,
+        )
 
-    # Many servers return application/xml for exceptions; GTIFF is usually image/tiff or application/octet-stream.
     if ("xml" in ct) or ("text" in ct):
-        txt = r.text
-        # keep it short
-        raise ValueError(f"WCS lieferte keine Rasterdaten (Content-Type={ct}). Antwort (Auszug): {txt[:1200]}")
+        txt = (r.text or "")[:1200]
+        raise WCSRequestError(
+            f"WCS lieferte keine Rasterdaten (Content-Type={ct}).",
+            request_url=full_url,
+            status_code=r.status_code,
+            content_type=ct,
+            body_excerpt=txt,
+        )
 
-    return r.content
+    return r.content, full_url
 
 
-def _render_from_geojson(geojson: Dict[str, Any], buffer_m: float) -> RenderResult:
+def _render_from_geojson(geojson: Dict[str, Any]) -> RenderResult:
     _cleanup_cache()
 
     geom_wgs84 = _extract_single_geometry(geojson)
@@ -317,29 +353,30 @@ def _render_from_geojson(geojson: Dict[str, Any], buffer_m: float) -> RenderResu
     if MAX_AOI_AREA_KM2 > 0 and aoi_area_km2 > MAX_AOI_AREA_KM2:
         raise ValueError(f"AOI ist zu groß: {aoi_area_km2:.3f} km² (Limit: {MAX_AOI_AREA_KM2:.3f} km²).")
 
-    # buffered bbox determines raster extent; we mask to AOI later
-    geom_buffered = geom_utm.buffer(buffer_m)
-    minx, miny, maxx, maxy = geom_buffered.bounds
+    # NO BUFFER: raster extent is AOI bbox
+    minx, miny, maxx, maxy = geom_utm.bounds
     bbox = (minx, miny, maxx, maxy)
 
     width_m = maxx - minx
     height_m = maxy - miny
     out_w, out_h = _compute_scaled_dims(width_m, height_m, MAX_RASTER_DIM_PX)
 
-    # choose coverage id: env default, but try capabilities autodetect
     coverage_id = WCS_COVERAGE_ID
     subset_axes = tuple([s.strip() for s in WCS_SUBSET_AXES.split(",")][:2])
     if len(subset_axes) != 2:
         subset_axes = ("e", "n")
 
-    # Try endpoints until one works
-    last_err = None
-    geotiff_bytes = None
-    used_base = None
+    last_err: Optional[Exception] = None
+    geotiff_bytes: Optional[bytes] = None
+    used_base: Optional[str] = None
+    used_url: Optional[str] = None
+    used_scaling = False
+    used_out_size: Optional[Tuple[int, int]] = None
 
     for base in WCS_URLS:
         used_base = base
-        # try to autodetect coverage id if possible (optional)
+
+        # optional autodetect coverage id
         try:
             caps = _try_get_capabilities(base)
             if caps:
@@ -352,41 +389,48 @@ def _render_from_geojson(geojson: Dict[str, Any], buffer_m: float) -> RenderResu
         # 1) try with scaling
         try:
             params = _build_getcoverage_params(coverage_id, bbox, subset_axes, out_w=out_w, out_h=out_h)
-            geotiff_bytes = _request_wcs_geotiff(base, params)
+            geotiff_bytes, used_url = _request_wcs_geotiff(base, params)
+            used_scaling = True
+            used_out_size = (out_w, out_h)
             break
         except Exception as e:
             last_err = e
 
-        # 2) retry without scaling (some servers don't support SCALESIZE)
+        # 2) fallback without scaling ONLY if native size would be reasonable
+        est_w = int(np.ceil(width_m / max(NATIVE_RES_M, 1e-6)))
+        est_h = int(np.ceil(height_m / max(NATIVE_RES_M, 1e-6)))
+        if max(est_w, est_h) > MAX_NATIVE_DIM_PX:
+            last_err = WCSRequestError(
+                f"WCS-Skalierung (SCALESIZE) wurde abgelehnt und unskalierte Anfrage wäre zu groß "
+                f"(geschätzt ~{est_w}×{est_h}px bei {NATIVE_RES_M}m). Bitte AOI verkleinern.",
+                request_url=(used_url or None),
+            )
+            continue
+
         try:
             params = _build_getcoverage_params(coverage_id, bbox, subset_axes, out_w=None, out_h=None)
-            geotiff_bytes = _request_wcs_geotiff(base, params)
+            geotiff_bytes, used_url = _request_wcs_geotiff(base, params)
+            used_scaling = False
+            used_out_size = None
             break
         except Exception as e:
             last_err = e
 
-    if geotiff_bytes is None:
+    if geotiff_bytes is None or used_base is None or used_url is None:
+        if isinstance(last_err, WCSRequestError):
+            raise last_err
         raise ValueError(f"WCS konnte nicht abgefragt werden. Letzter Fehler: {last_err}")
 
     job_id = uuid.uuid4().hex[:12]
-    raw_tif = TMP_DIR / f"{job_id}.raw.tif"
     out_tif = TMP_DIR / f"{job_id}.aoi.tif"
     out_png = TMP_DIR / f"{job_id}.aoi.png"
 
-    raw_tif.write_bytes(geotiff_bytes)
-
-    # Mask to AOI (keep full buffered extent, transparent/nodata outside AOI)
+    # Mask to AOI (extent = bbox), transparent/nodata outside AOI
     with MemoryFile(geotiff_bytes) as memfile:
         with memfile.open() as src:
-            # Use AOI in same CRS as raster
-            aoi_geom = geom_utm
-            # rasterio.mask expects geojson mappings
-            geoms = [mapping(aoi_geom)]
-
-            # Keep extent (crop=False), but mask outside AOI
+            geoms = [mapping(geom_utm)]
             masked, out_transform = rio_mask(src, geoms, crop=False, filled=False)
 
-            # Prefer RGB from first 3 bands; if fewer, replicate
             data = masked.data
             msk = masked.mask
 
@@ -403,22 +447,16 @@ def _render_from_geojson(geojson: Dict[str, Any], buffer_m: float) -> RenderResu
             else:
                 raise ValueError(f"Unerwartete Bandanzahl: {bands}")
 
-            # Build alpha: valid if NOT masked in all RGB bands
             valid = ~np.all(rgb_mask, axis=0)
             alpha = (valid.astype(np.uint8) * 255)
 
-            # Fill masked pixels in rgb with 0
             for b in range(3):
                 rgb[b][rgb_mask[b]] = 0
 
-            # Convert to uint8 if needed
             if rgb.dtype != np.uint8:
-                # robust scaling by dtype range
                 rgb = rgb.astype(np.float32)
-                # heuristic: clamp 0..255
                 rgb = np.clip(rgb, 0, 255).astype(np.uint8)
 
-            # Write GeoTIFF as RGBA (4 bands)
             profile = src.profile.copy()
             profile.update(
                 driver="GTiff",
@@ -434,25 +472,22 @@ def _render_from_geojson(geojson: Dict[str, Any], buffer_m: float) -> RenderResu
                 dst.write(rgb.astype(np.uint8), indexes=[1, 2, 3])
                 dst.write(alpha.astype(np.uint8), indexes=4)
 
-            # Write PNG (RGBA)
-            rgba = np.dstack(
-                [
-                    np.transpose(rgb, (1, 2, 0)),
-                    alpha,
-                ]
-            )
+            rgba = np.dstack([np.transpose(rgb, (1, 2, 0)), alpha])
             Image.fromarray(rgba, mode="RGBA").save(out_png)
 
-    # bounds for leaflet overlay in WGS84
     bounds_wgs84 = _bounds_epsg_to_wgs84(minx, miny, maxx, maxy, WCS_EPSG)
 
     return RenderResult(
         job_id=job_id,
         bounds_wgs84=bounds_wgs84,
         aoi_area_km2=aoi_area_km2,
-        buffer_m=buffer_m,
         png_path=out_png,
         tif_path=out_tif,
+        wcs_request_url=used_url,
+        wcs_base_url=used_base,
+        coverage_id=coverage_id,
+        used_scaling=used_scaling,
+        out_size=used_out_size,
     )
 
 
@@ -486,12 +521,7 @@ INDEX_HTML = """
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
       --font: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
     }
-    body{
-      margin:0;
-      font-family: var(--font);
-      background: var(--bg);
-      color: var(--text);
-    }
+    body{ margin:0; font-family: var(--font); background: var(--bg); color: var(--text); }
     .wrap{
       max-width: var(--container);
       margin: 18px auto;
@@ -509,16 +539,8 @@ INDEX_HTML = """
       justify-content:space-between;
       gap: 12px;
     }
-    h1{
-      font-size: 18px;
-      margin:0;
-      letter-spacing: .2px;
-    }
-    .hint{
-      color: var(--muted);
-      font-size: 13px;
-      margin-top: 6px;
-    }
+    h1{ font-size: 18px; margin:0; letter-spacing: .2px; }
+    .hint{ color: var(--muted); font-size: 13px; margin-top: 6px; }
     .card{
       background: var(--card);
       border: 1px solid var(--border);
@@ -526,20 +548,9 @@ INDEX_HTML = """
       box-shadow: 0 18px 60px rgba(0,0,0,.35);
       overflow: hidden;
     }
-    #map{
-      height: 70vh;
-      min-height: 520px;
-    }
-    .panel{
-      padding: 12px;
-      display:flex;
-      flex-direction:column;
-      gap: 10px;
-    }
-    label{
-      color: var(--muted);
-      font-size: 12px;
-    }
+    #map{ height: 70vh; min-height: 520px; }
+    .panel{ padding: 12px; display:flex; flex-direction:column; gap: 10px; }
+    label{ color: var(--muted); font-size: 12px; }
     textarea{
       width: 100%;
       min-height: 220px;
@@ -553,16 +564,8 @@ INDEX_HTML = """
       font-size: 12px;
       outline: none;
     }
-    textarea:focus{
-      border-color: var(--primary);
-      box-shadow: 0 0 0 4px var(--focus);
-    }
-    .row{
-      display:flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
+    textarea:focus{ border-color: var(--primary); box-shadow: 0 0 0 4px var(--focus); }
+    .row{ display:flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     button{
       appearance:none;
       border: 1px solid var(--border);
@@ -573,14 +576,8 @@ INDEX_HTML = """
       cursor: pointer;
       font-weight: 600;
     }
-    button.primary{
-      border-color: rgba(110,168,254,.35);
-      background: rgba(110,168,254,.16);
-    }
-    button:disabled{
-      opacity:.55;
-      cursor:not-allowed;
-    }
+    button.primary{ border-color: rgba(110,168,254,.35); background: rgba(110,168,254,.16); }
+    button:disabled{ opacity:.55; cursor:not-allowed; }
     .status{
       color: var(--muted);
       font-size: 13px;
@@ -589,21 +586,13 @@ INDEX_HTML = """
       border-radius: 12px;
       background: rgba(0,0,0,.18);
       border: 1px solid var(--border);
+      word-break: break-word;
     }
     .status b{ color: var(--text); }
-    .err{
-      border-color: rgba(255,100,100,.35);
-      background: rgba(255,100,100,.10);
-      color: #ffd1d1;
-    }
-    .ok{
-      border-color: rgba(120,220,160,.35);
-      background: rgba(120,220,160,.08);
-    }
-    .small{
-      font-size: 12px;
-      color: var(--muted);
-    }
+    .err{ border-color: rgba(255,100,100,.35); background: rgba(255,100,100,.10); color: #ffd1d1; }
+    .ok{ border-color: rgba(120,220,160,.35); background: rgba(120,220,160,.08); }
+    .small{ font-size: 12px; color: var(--muted); }
+    code{ font-family: var(--mono); font-size: 12px; }
     a{ color: var(--primary); text-decoration: none; }
     a:hover{ text-decoration: underline; }
   </style>
@@ -612,7 +601,10 @@ INDEX_HTML = """
   <header>
     <div>
       <h1>{{ title }}</h1>
-      <div class="hint">Zeichne ein Polygon oder Rechteck. Es ist immer nur <b>ein</b> Feature aktiv – neues Feature ersetzt das alte. DOP20 wird nur <b>innerhalb</b> der AOI angezeigt; außerhalb (Buffer) bleibt OSM sichtbar.</div>
+      <div class="hint">
+        Zeichne ein Polygon oder Rechteck. Es ist immer nur <b>ein</b> Feature aktiv – neues Feature ersetzt das alte.
+        DOP20 wird nur <b>innerhalb</b> der AOI angezeigt; außerhalb des Polygons bleibt OSM sichtbar.
+      </div>
     </div>
     <div class="small">API: <code>/api/geotiff</code> oder <code>/api/png</code></div>
   </header>
@@ -627,10 +619,6 @@ INDEX_HTML = """
         <div class="row">
           <button id="btn-clear">AOI löschen</button>
           <button class="primary" id="btn-render" disabled>Vorschau laden</button>
-        </div>
-
-        <div class="row">
-          <label>Buffer (m): <input id="buf" type="number" min="0" step="10" value="{{ default_buffer }}" style="width:120px; margin-left:8px; padding:8px; border-radius:10px; border:1px solid var(--border); background: rgba(255,255,255,.04); color:var(--text);"></label>
         </div>
 
         <div id="status" class="status">Noch keine AOI.</div>
@@ -657,7 +645,7 @@ INDEX_HTML = """
   <script>
     const map = L.map('map', { preferCanvas: true }).setView([50.55, 9.0], 8);
 
-    const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 20,
       attribution: '&copy; OpenStreetMap'
     }).addTo(map);
@@ -673,11 +661,7 @@ INDEX_HTML = """
         polygon: { allowIntersection: false, showArea: true },
         rectangle: true
       },
-      edit: {
-        featureGroup: drawn,
-        edit: true,
-        remove: false
-      }
+      edit: { featureGroup: drawn, edit: true, remove: false }
     });
     map.addControl(drawControl);
 
@@ -692,7 +676,12 @@ INDEX_HTML = """
     const btnGJ = document.getElementById('btn-geojson');
     const btnPNG = document.getElementById('btn-png');
     const btnTIF = document.getElementById('btn-tif');
-    const elBuf = document.getElementById('buf');
+
+    function escapeHtml(s){
+      return String(s).replace(/[&<>"']/g, (c) => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
 
     function setStatus(html, cls){
       elStatus.className = 'status' + (cls ? (' ' + cls) : '');
@@ -720,12 +709,12 @@ INDEX_HTML = """
     }
 
     function featureToGeoJSON(layer){
-    return {
+      return {
         type: "Feature",
         properties: { epsg: 4326 },
         geometry: layer.toGeoJSON().geometry
-    };
-}
+      };
+    }
 
     function downloadText(filename, text){
       const blob = new Blob([text], {type: 'application/json;charset=utf-8'});
@@ -740,7 +729,6 @@ INDEX_HTML = """
     }
 
     map.on(L.Draw.Event.CREATED, function (e) {
-      // enforce single feature
       drawn.clearLayers();
       if(overlay){
         map.removeLayer(overlay);
@@ -756,7 +744,7 @@ INDEX_HTML = """
       elGeo.value = JSON.stringify(gj, null, 2);
 
       setButtons(true, false);
-      setStatus('AOI gesetzt. Klicke <b>Vorschau laden</b>, um DOP20 zu holen.', 'ok');
+      setStatus('AOI gesetzt. Klicke <b>Vorschau laden</b>.', 'ok');
     });
 
     map.on('draw:edited', function(){
@@ -782,47 +770,61 @@ INDEX_HTML = """
       downloadText('aoi.geojson', elGeo.value);
     });
 
+    async function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
+
+    async function postPreviewWithRetry(body, tries=2){
+      let last = null;
+      for(let i=0;i<tries;i++){
+        const res = await fetch('/api/preview', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body)
+        });
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        const raw = await res.text();
+        last = {res, ct, raw};
+        if(res.status === 503 && i < tries-1){
+          // transient Cloud Run issue -> short backoff & retry :contentReference[oaicite:5]{index=5}
+          await sleep(700 * (i+1));
+          continue;
+        }
+        return last;
+      }
+      return last;
+    }
+
     async function renderPreview(){
       if(!currentFeature) return;
       if (btnRender.dataset.busy === "1") return;
+
       btnRender.dataset.busy = "1";
       btnRender.disabled = true;
       setButtons(true, false);
-      setStatus('Lade DOP20 via WCS…', '');
-
-      const buffer_m = Number(elBuf.value || 0);
+      setStatus('Sende Anfrage… (WCS-URL wird nach Antwort angezeigt)', '');
 
       let gj;
       try{
         gj = JSON.parse(elGeo.value);
       }catch(err){
         setStatus('GeoJSON ist ungültig.', 'err');
-        return;
-      }finally {
         btnRender.dataset.busy = "0";
         btnRender.disabled = !currentFeature;
+        return;
       }
 
       try{
-        const res = await fetch('/api/preview', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ geojson: gj, buffer_m })
-        });
-
-        const ct = (res.headers.get('content-type') || '').toLowerCase();
-        const raw = await res.text();
+        const {res, ct, raw} = await postPreviewWithRetry({ geojson: gj }, 2);
 
         let data = null;
         if (ct.includes('application/json')) {
           data = raw ? JSON.parse(raw) : {};
         } else {
-          // Hier siehst du künftig den echten Cloud-Run/Proxy-Fehlerauszug
           throw new Error(`Server lieferte kein JSON (HTTP ${res.status}, Content-Type=${ct}). Antwort-Auszug: ${raw.slice(0, 240)}`);
         }
 
         if (!res.ok) {
-          throw new Error((data && data.error) ? data.error : (`HTTP ${res.status}`));
+          const wcs = data && data.wcs_request_url ? (`<div class="small"><b>WCS:</b> <code>${escapeHtml(data.wcs_request_url)}</code></div>`) : '';
+          throw new Error(((data && data.error) ? data.error : (`HTTP ${res.status}`)) + (wcs ? ("\\n" + data.wcs_request_url) : ""));
         }
 
         currentJob = data.job_id;
@@ -831,32 +833,43 @@ INDEX_HTML = """
           map.removeLayer(overlay);
           overlay = null;
         }
-        const b = data.overlay.bounds; // [[south, west],[north, east]]
+        const b = data.overlay.bounds;
         overlay = L.imageOverlay(data.overlay.url, b, { opacity: 1.0, interactive: false });
         overlay.addTo(map);
 
-        const fit = L.latLngBounds(b);
-        map.fitBounds(fit.pad(0.15));
+        map.fitBounds(L.latLngBounds(b).pad(0.15));
 
         setButtons(true, true);
+
+        const wcsLine = data.wcs && data.wcs.request_url
+          ? `<div class="small"><b>WCS:</b> <code>${escapeHtml(data.wcs.request_url)}</code></div>`
+          : '';
+
         setStatus(
-          `DOP20 geladen. <b>AOI</b>: ${data.aoi_area_km2.toFixed(3)} km² · <b>Buffer</b>: ${data.buffer_m.toFixed(0)} m`,
+          `DOP20 geladen. <b>AOI</b>: ${data.aoi_area_km2.toFixed(3)} km²` + wcsLine,
           'ok'
         );
 
-        // wire download buttons
         btnPNG.onclick = () => { window.location = data.download.png; };
         btnTIF.onclick = () => { window.location = data.download.geotiff; };
 
       }catch(err){
         setButtons(true, false);
-        setStatus('Fehler: ' + (err && err.message ? err.message : String(err)), 'err');
+        const msg = (err && err.message) ? String(err.message) : String(err);
+        // if message contains a URL line, render it nicely
+        const parts = msg.split('\\n');
+        const head = escapeHtml(parts[0] || msg);
+        const maybeUrl = parts.slice(1).join('\\n').trim();
+        const urlHtml = maybeUrl ? `<div class="small"><b>WCS:</b> <code>${escapeHtml(maybeUrl)}</code></div>` : '';
+        setStatus('Fehler: ' + head + urlHtml, 'err');
+      }finally{
+        btnRender.dataset.busy = "0";
+        btnRender.disabled = !currentFeature;
       }
     }
 
     btnRender.addEventListener('click', renderPreview);
 
-    // init
     clearAll();
   </script>
 </body>
@@ -869,7 +882,6 @@ def index():
     return render_template_string(
         INDEX_HTML,
         title=APP_TITLE,
-        default_buffer=int(DEFAULT_BUFFER_M),
         max_area_km2=MAX_AOI_AREA_KM2,
     )
 
@@ -879,16 +891,14 @@ def api_preview():
     try:
         body = request.get_json(force=True, silent=False) or {}
         gj = _parse_geojson(body.get("geojson"))
-        buffer_m = float(body.get("buffer_m", DEFAULT_BUFFER_M))
 
-        rr = _render_from_geojson(gj, buffer_m)
+        rr = _render_from_geojson(gj)
 
-        sw, ne = rr.bounds_wgs84  # ((south, west), (north, east))
+        sw, ne = rr.bounds_wgs84
         return jsonify(
             {
                 "job_id": rr.job_id,
                 "aoi_area_km2": rr.aoi_area_km2,
-                "buffer_m": rr.buffer_m,
                 "overlay": {
                     "url": f"/r/{rr.job_id}/overlay.png",
                     "bounds": [[sw[0], sw[1]], [ne[0], ne[1]]],
@@ -897,7 +907,27 @@ def api_preview():
                     "png": f"/r/{rr.job_id}/aoi.png",
                     "geotiff": f"/r/{rr.job_id}/aoi.tif",
                 },
+                "wcs": {
+                    "base_url": rr.wcs_base_url,
+                    "request_url": rr.wcs_request_url,
+                    "coverage_id": rr.coverage_id,
+                    "used_scaling": rr.used_scaling,
+                    "out_size": rr.out_size,
+                },
             }
+        )
+    except WCSRequestError as e:
+        return (
+            jsonify(
+                {
+                    "error": str(e),
+                    "wcs_request_url": e.request_url,
+                    "wcs_status_code": e.status_code,
+                    "wcs_content_type": e.content_type,
+                    "wcs_body_excerpt": e.body_excerpt,
+                }
+            ),
+            502,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -906,21 +936,33 @@ def api_preview():
 @app.post("/api/geotiff")
 def api_geotiff():
     """
-    API: GeoJSON rein -> GeoTIFF (RGBA, Buffer-Extent, DOP nur innerhalb AOI; außerhalb nodata/transparent)
-    Body: { "geojson": <Feature|FeatureCollection(1)|Polygon>, "buffer_m": 200 }
+    API: GeoJSON rein -> GeoTIFF (RGBA, Extent = AOI bbox, DOP nur innerhalb AOI; außerhalb nodata/transparent)
+    Body: { "geojson": <Feature|FeatureCollection(1)|Polygon> }
     """
     try:
         body = request.get_json(force=True, silent=False) or {}
         gj = _parse_geojson(body.get("geojson"))
-        buffer_m = float(body.get("buffer_m", DEFAULT_BUFFER_M))
 
-        rr = _render_from_geojson(gj, buffer_m)
+        rr = _render_from_geojson(gj)
         return send_file(
             rr.tif_path,
             mimetype="image/tiff",
             as_attachment=True,
             download_name=f"aoi_{rr.job_id}_epsg{WCS_EPSG}.tif",
             conditional=True,
+        )
+    except WCSRequestError as e:
+        return (
+            jsonify(
+                {
+                    "error": str(e),
+                    "wcs_request_url": e.request_url,
+                    "wcs_status_code": e.status_code,
+                    "wcs_content_type": e.content_type,
+                    "wcs_body_excerpt": e.body_excerpt,
+                }
+            ),
+            502,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -929,20 +971,33 @@ def api_geotiff():
 @app.post("/api/png")
 def api_png():
     """
-    API: GeoJSON rein -> PNG (RGBA Overlay; gleiche Logik wie Web)
+    API: GeoJSON rein -> PNG (RGBA Overlay)
+    Body: { "geojson": <Feature|FeatureCollection(1)|Polygon> }
     """
     try:
         body = request.get_json(force=True, silent=False) or {}
         gj = _parse_geojson(body.get("geojson"))
-        buffer_m = float(body.get("buffer_m", DEFAULT_BUFFER_M))
 
-        rr = _render_from_geojson(gj, buffer_m)
+        rr = _render_from_geojson(gj)
         return send_file(
             rr.png_path,
             mimetype="image/png",
             as_attachment=True,
             download_name=f"aoi_{rr.job_id}.png",
             conditional=True,
+        )
+    except WCSRequestError as e:
+        return (
+            jsonify(
+                {
+                    "error": str(e),
+                    "wcs_request_url": e.request_url,
+                    "wcs_status_code": e.status_code,
+                    "wcs_content_type": e.content_type,
+                    "wcs_body_excerpt": e.body_excerpt,
+                }
+            ),
+            502,
         )
     except Exception as e:
         return jsonify({"error": str(e)}), 400
@@ -953,7 +1008,6 @@ def job_overlay(job_id: str):
     p = TMP_DIR / f"{job_id}.aoi.png"
     if not p.exists():
         return jsonify({"error": "Job nicht gefunden/abgelaufen."}), 404
-    # overlay should be cacheable per job_id
     return send_file(p, mimetype="image/png", as_attachment=False, conditional=True)
 
 
@@ -977,6 +1031,7 @@ def job_tif(job_id: str):
         download_name=f"aoi_{job_id}_epsg{WCS_EPSG}.tif",
         conditional=True,
     )
+
 
 @app.get("/healthz")
 def healthz():
