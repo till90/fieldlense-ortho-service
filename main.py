@@ -784,6 +784,9 @@ INDEX_HTML = """
 
     async function renderPreview(){
       if(!currentFeature) return;
+      if (btnRender.dataset.busy === "1") return;
+      btnRender.dataset.busy = "1";
+      btnRender.disabled = true;
       setButtons(true, false);
       setStatus('Lade DOP20 via WCS…', '');
 
@@ -795,6 +798,9 @@ INDEX_HTML = """
       }catch(err){
         setStatus('GeoJSON ist ungültig.', 'err');
         return;
+      }finally {
+        btnRender.dataset.busy = "0";
+        btnRender.disabled = !currentFeature;
       }
 
       try{
@@ -804,9 +810,19 @@ INDEX_HTML = """
           body: JSON.stringify({ geojson: gj, buffer_m })
         });
 
-        const data = await res.json();
-        if(!res.ok){
-          throw new Error(data && data.error ? data.error : ('HTTP ' + res.status));
+        const ct = (res.headers.get('content-type') || '').toLowerCase();
+        const raw = await res.text();
+
+        let data = null;
+        if (ct.includes('application/json')) {
+          data = raw ? JSON.parse(raw) : {};
+        } else {
+          // Hier siehst du künftig den echten Cloud-Run/Proxy-Fehlerauszug
+          throw new Error(`Server lieferte kein JSON (HTTP ${res.status}, Content-Type=${ct}). Antwort-Auszug: ${raw.slice(0, 240)}`);
+        }
+
+        if (!res.ok) {
+          throw new Error((data && data.error) ? data.error : (`HTTP ${res.status}`));
         }
 
         currentJob = data.job_id;
