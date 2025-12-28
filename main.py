@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+API:
+- POST /api/preview -> Erstellt eine Vorschau für ein GeoJSON-Gebiet
+- POST /api/geotiff -> Gibt eine GeoTIFF-Datei für ein GeoJSON-Gebiet zurück
+- POST /api/png -> Gibt eine PNG-Datei für ein GeoJSON-Gebiet zurück
+- GET /r/<job_id>/overlay.png -> Ruft das Overlay-Bild für einen bestimmten Job ab
+- GET /r/<job_id>/aoi.png -> Ruft das AOI-Bild für einen bestimmten Job ab
+- GET /r/<job_id>/aoi.tif -> Ruft die AOI-GeoTIFF-Datei für einen bestimmten Job ab
+- GET /healthz -> Überprüft den Zustand des Dienstes
+"""
 
 import json
 import os
